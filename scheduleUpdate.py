@@ -1,9 +1,11 @@
-import requests
+import aiohttp
+import asyncio
 import os
 import logging
 from datetime import datetime, date
 import pytz
 from database import get_db_connection
+import traceback
 
 logging.basicConfig(
     filename="logs/fetch_schedule.log",
@@ -56,30 +58,36 @@ def determine_week(game_date):
     logging.warning(f"Could not determine week for game date: {game_date}")
     return None
 
-# Function to fetch game data from the API
-def fetch_game_data():
+# Asynchronous function to fetch game data from the API
+async def fetch_game_data():
     url = "https://tank01-nfl-live-in-game-real-time-statistics-nfl.p.rapidapi.com/getNFLGamesForWeek"
     headers = {
         "x-rapidapi-key": os.getenv("RAPIDAPI_KEY"),
         "x-rapidapi-host": "tank01-nfl-live-in-game-real-time-statistics-nfl.p.rapidapi.com"
     }
-    try:
-        response = requests.get(url, headers=headers, params={"week": "all", "seasonType": "reg", "season": "2024"})
-        response.raise_for_status()
-        logging.info("Successfully fetched game schedule from API")
-        update_api_usage(1)
-        return response.json().get('body', []), 1
-    except requests.RequestException as e:
-        logging.error(f"Error fetching game schedule from API: {e}")
-        return None, 0
+    params = {"week": "all", "seasonType": "reg", "season": "2024"}
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, headers=headers, params=params) as response:
+                if response.status == 200:
+                    logging.info("Successfully fetched game schedule from API")
+                    response_data = await response.json()
+                    update_api_usage(1)
+                    return response_data.get('body', []), 1
+                else:
+                    error_text = await response.text()
+                    logging.error(f"Failed to fetch game schedule: {response.status} - {error_text}")
+                    return None, 0
+        except aiohttp.ClientError as e:
+            logging.error(f"Error fetching game schedule from API: {e}")
+            return None, 0
 
 # Function to update API usage
-def update_api_usage(api_calls):
+def update_api_usage(api_calls, db, cursor):
     current_month_year = datetime.now().strftime("%Y-%m")
 
-    db = get_db_connection()
-    cursor = db.cursor()
-
+    # Check the current usage for the month
     cursor.execute("SELECT request_count FROM api_usage WHERE month_year = %s", (current_month_year,))
     result = cursor.fetchone()
 
@@ -87,20 +95,14 @@ def update_api_usage(api_calls):
         new_count = result[0] + api_calls
         cursor.execute("UPDATE api_usage SET request_count = %s, request_time = NOW() WHERE month_year = %s",
                        (new_count, current_month_year))
+        logging.info(f"Updated API usage for month {current_month_year}: new count is {new_count}")
     else:
         cursor.execute("INSERT INTO api_usage (request_count, request_time, month_year) VALUES (%s, NOW(), %s)",
                        (api_calls, current_month_year))
-
-    db.commit()
-    cursor.close()
-    db.close()
-    logging.info(f"API usage updated. Total requests this month: {new_count if result else api_calls}.")
+        logging.info(f"Inserted new API usage record for month {current_month_year}: count is {api_calls}")
 
 # Function to update pick_window table
-def update_pick_window_table(games, week, season):
-    db = get_db_connection()
-    cursor = db.cursor()
-
+def update_pick_window_table(games, week, season, db, cursor):
     game_times = [
         (convert_to_irish_time(game["gameDate"], game["gameTime"]), game["gameDate"])
         for game in games if game["gameWeek"] == f"Week {week}"
@@ -134,19 +136,10 @@ def update_pick_window_table(games, week, season):
             )
             logging.info(f"Inserted new pick window entry for week {week}, season {season}, start time {start_time}")
         else:
-            logging.info(f"Duplicate entry skipped for week {week}, season {season}, start time {start_time}")
-
-    db.commit()
-    cursor.close()
-    db.close()
-    logging.info(f"Pick window table update completed for week {week}, season {season}.")
+            logging.debug(f"Duplicate entry skipped for week {week}, season {season}, start time {start_time}")
 
 # Function to upsert game data into the games table
-# Function to upsert game data into the games table
-def upsert_game_data(games):
-    db = get_db_connection()
-    cursor = db.cursor()
-
+def upsert_game_data(games, db, cursor):
     for game in games:
         game_id = game.get("gameID")
         season_type = game.get("seasonType")
@@ -165,99 +158,63 @@ def upsert_game_data(games):
         espn_link = game.get("espnLink")
         cbs_link = game.get("cbsLink")
         season = game.get("season")
-
         game_time = convert_to_irish_time(game.get("gameDate"), game.get("gameTime"))
 
-        # Check if game already exists and update only if data has changed
-        cursor.execute("SELECT * FROM games WHERE game_id = %s", (game_id,))
-        existing_game = cursor.fetchone()
-
-        # If game exists, check if data needs updating
-        if existing_game:
-            # Check if each column has the same value; if any differ, update is needed
-            existing_values = {
-                'season_type': existing_game[1],
-                'week': existing_game[2],
-                'home_team': existing_game[3],
-                'away_team': existing_game[4],
-                'teamID_home': existing_game[5],
-                'teamID_away': existing_game[6],
-                'game_time': existing_game[7],
-                'game_status': existing_game[8],
-                'game_status_code': existing_game[9],
-                'neutral_site': existing_game[10],
-                'espn_link': existing_game[11],
-                'cbs_link': existing_game[12],
-                'season': existing_game[14]
-            }
-
-            new_values = {
-                'season_type': season_type,
-                'week': week,
-                'home_team': home_team,
-                'away_team': away_team,
-                'teamID_home': teamID_home,
-                'teamID_away': teamID_away,
-                'game_time': game_time,
-                'game_status': game_status,
-                'game_status_code': game_status_code,
-                'neutral_site': neutral_site,
-                'espn_link': espn_link,
-                'cbs_link': cbs_link,
-                'season': season
-            }
-
-            if existing_values != new_values:
-                cursor.execute(
-                    """
-                    UPDATE games SET
-                        season_type = %s,
-                        week = %s,
-                        home_team = %s,
-                        away_team = %s,
-                        teamID_home = %s,
-                        teamID_away = %s,
-                        game_time = %s,
-                        game_status = %s,
-                        game_status_code = %s,
-                        neutral_site = %s,
-                        espn_link = %s,
-                        cbs_link = %s,
-                        last_updated = CURRENT_TIMESTAMP,
-                        season = %s
-                    WHERE game_id = %s
-                    """,
-                    (season_type, week, home_team, away_team, teamID_home, teamID_away,
-                     game_time, game_status, game_status_code, neutral_site, espn_link, cbs_link, season, game_id)
-                )
-                logging.info(f"Updated game data for game_id: {game_id}")
-
-        else:
-            # Insert if game does not exist
+        # Perform update or insert
+        try:
             cursor.execute(
                 """
                 INSERT INTO games (game_id, season_type, week, home_team, away_team, teamID_home, teamID_away, game_time,
                                    game_status, game_status_code, neutral_site, espn_link, cbs_link, last_updated, season)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, %s)
+                ON DUPLICATE KEY UPDATE
+                    season_type = VALUES(season_type),
+                    week = VALUES(week),
+                    home_team = VALUES(home_team),
+                    away_team = VALUES(away_team),
+                    teamID_home = VALUES(teamID_home),
+                    teamID_away = VALUES(teamID_away),
+                    game_time = VALUES(game_time),
+                    game_status = VALUES(game_status),
+                    game_status_code = VALUES(game_status_code),
+                    neutral_site = VALUES(neutral_site),
+                    espn_link = VALUES(espn_link),
+                    cbs_link = VALUES(cbs_link),
+                    last_updated = CURRENT_TIMESTAMP,
+                    season = VALUES(season)
                 """,
                 (game_id, season_type, week, home_team, away_team, teamID_home, teamID_away, game_time,
                  game_status, game_status_code, neutral_site, espn_link, cbs_link, season)
             )
-            logging.info(f"Inserted new game data for game_id: {game_id}")
+            logging.info(f"Upsert query executed for game_id: {game_id}")
+        except Exception as e:
+            logging.error(f"Error executing upsert for game_id {game_id}: {e}")
+            logging.error(traceback.format_exc())
 
-    db.commit()
-    cursor.close()
-    db.close()
-    logging.info("Games table update completed successfully.")
+# Main execution with asyncio
+async def main():
+    logging.info("Starting TD Showdown game schedule update.")
+    db = get_db_connection()
+    cursor = db.cursor()
+    try:
+        games, api_calls = await fetch_game_data()
+        season = 2024  # Define season
+
+        if games:
+            logging.info(f"Fetched {len(games)} games from the API.")
+            upsert_game_data(games, db, cursor)  # Call to upsert game data directly after fetching games.
+            for week in range(1, 19):  # Example for 18 weeks
+                update_pick_window_table(games, week, season, db, cursor)
+
+        update_api_usage(api_calls, db, cursor)
+        logging.info("Game schedule update completed successfully.")
+    except Exception as e:
+        logging.error(f"An error occurred during the schedule update: {e}")
+        logging.error(traceback.format_exc())
+    finally:
+        cursor.close()
+        db.close()
+        logging.info("Database connection closed.")
 
 if __name__ == "__main__":
-    logging.info("Starting TD Showdown game schedule update.")
-    games, api_calls = fetch_game_data()
-    season = 2024  # Define season
-
-    if games:
-        for week in range(1, 19):  # Example for 18 weeks
-            update_pick_window_table(games, week, season)
-
-    update_api_usage(api_calls)
-    logging.info("Game schedule update completed successfully.")
+    asyncio.run(main())
