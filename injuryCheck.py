@@ -20,7 +20,6 @@ async def fetch_injury_status(player_ids):
         "x-rapidapi-host": os.getenv("RAPIDAPI_HOST")
     }
 
-    # Prepare the list of player IDs for filtering
     params = {"playerIDs": ",".join(map(str, player_ids))}
 
     async with aiohttp.ClientSession() as session:
@@ -38,24 +37,59 @@ async def fetch_injury_status(player_ids):
             logging.error(f"Error fetching player injury status from API: {e}")
             return None
 
-# Function to update the injury status in the database
-def update_injury_status(players, db, cursor):
-    for player in players:
-        player_id = player.get("playerID")
-        injury_status = player["injury"].get("designation", "Healthy")
+# Function to update the injury status in the database and trigger a webhook notification
+async def update_injury_status(players, db, cursor):
+    async with aiohttp.ClientSession() as session:
+        for player in players:
+            player_id = player.get("playerID")
+            injury_status = player["injury"].get("designation", "Healthy")
 
-        if injury_status in ["Doubtful", "Out", "Injured Reserve"]:
-            logging.info(f"Player {player_id} is injured with status {injury_status}")
-            try:
-                # Update only those players in the picks table who have been marked as injured
-                cursor.execute("""
-                    UPDATE picks SET Is_injured = 1
-                    WHERE player_id = %s AND is_successful = 0 AND Is_injured = 0
-                """, (player_id,))
-                logging.info(f"Updated injury status for player_id {player_id} in picks table")
-            except Exception as e:
-                logging.error(f"Failed to update injury status for player_id {player_id}: {e}")
-                logging.error(traceback.format_exc())
+            if injury_status in ["Doubtful", "Out", "Injured Reserve"]:
+                logging.info(f"Player {player_id} is injured with status {injury_status}")
+                try:
+                    # Update only those players in the picks table who have been marked as injured
+                    cursor.execute("""
+                        UPDATE picks SET Is_injured = 1
+                        WHERE player_id = %s AND is_successful = 0 AND Is_injured = 0
+                    """, (player_id,))
+                    logging.info(f"Updated injury status for player_id {player_id} in picks table")
+
+                    # Fetch the user IDs who picked the injured player
+                    cursor.execute("""
+                        SELECT user_id FROM picks WHERE player_id = %s AND is_successful = 0
+                    """, (player_id,))
+                    tagged_users = [row['user_id'] for row in cursor.fetchall()]
+
+                    # Trigger the webhook to notify users about the injury
+                    if tagged_users:
+                        await send_injury_notification(session, player.get("fullName"), injury_status, tagged_users)
+
+                except Exception as e:
+                    logging.error(f"Failed to update injury status for player_id {player_id}: {e}")
+                    logging.error(traceback.format_exc())
+
+# Function to send injury notification via webhook
+async def send_injury_notification(session, player_name, injury_status, tagged_users):
+    url = "http://localhost:3000/webhook/player-injury"
+    headers = {
+        "Authorization": os.getenv("WEBHOOK_SECRET"),
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "playerName": player_name,
+        "injuryStatus": injury_status,
+        "taggedUsers": tagged_users
+    }
+
+    try:
+        async with session.post(url, json=payload, headers=headers) as response:
+            if response.status == 200:
+                logging.info(f"Successfully sent injury notification for player: {player_name}")
+            else:
+                error_text = await response.text()
+                logging.error(f"Failed to send injury notification: {response.status} - {error_text}")
+    except aiohttp.ClientError as e:
+        logging.error(f"Error sending injury notification: {e}")
 
 # Main execution for injury check
 async def main():
@@ -74,7 +108,7 @@ async def main():
         # Fetch the injury status for only the relevant players
         players = await fetch_injury_status(player_ids)
         if players:
-            update_injury_status(players, db, cursor)
+            await update_injury_status(players, db, cursor)
 
         db.commit()
         logging.info("Player injury status update completed successfully.")

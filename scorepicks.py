@@ -14,6 +14,8 @@ logging.basicConfig(
 # Load environment variables from .env file
 load_dotenv()
 
+WEBHOOK_URL = "http://localhost:3000/webhook/player-touchdown"  # Your webhook endpoint URL
+
 # Function to update API usage count
 def update_api_usage(api_calls):
     current_month_year = datetime.datetime.now().strftime('%Y-%m')
@@ -38,6 +40,26 @@ def update_api_usage(api_calls):
     db.commit()
     cursor.close()
     db.close()
+
+# Function to send touchdown notification via webhook
+def send_touchdown_notification(player_name, tagged_users):
+    headers = {
+        "Authorization": os.getenv("WEBHOOK_SECRET"),
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "playerName": player_name,
+        "taggedUsers": tagged_users
+    }
+
+    try:
+        response = requests.post(WEBHOOK_URL, json=payload, headers=headers)
+        if response.status_code == 200:
+            logging.info(f"Successfully sent touchdown notification for player: {player_name}")
+        else:
+            logging.error(f"Failed to send touchdown notification: {response.status_code} - {response.text}")
+    except requests.RequestException as e:
+        logging.error(f"Error sending touchdown notification: {e}")
 
 # Function to check if a player has scored and update the game status
 def check_player_scores_and_update_game_status():
@@ -102,6 +124,16 @@ def check_player_scores_and_update_game_status():
                         WHERE user_id = %s AND week = %s AND points_week = 0
                     ''', (pick['user_id'], pick['week']))
                     logging.info(f"Updated leaderboard for user_id {pick['user_id']} in week {pick['week']}: incremented points.")
+
+                    # Fetch the user IDs who picked the player
+                    cursor.execute("""
+                        SELECT user_id FROM picks WHERE player_id = %s AND is_successful = 1
+                    """, (player_id,))
+                    tagged_users = [row['user_id'] for row in cursor.fetchall()]
+
+                    # Trigger the webhook to notify users about the touchdown
+                    if tagged_users:
+                        send_touchdown_notification(play.get("playerName"), tagged_users)
 
         else:
             logging.error(f"Failed to fetch game data for game_id {game_id}. Status code: {response.status_code}")
