@@ -6,7 +6,7 @@ from database import get_db_connection
 import logging
 
 # Configure logging
-logging.basicConfig(filename="logs/screate-game-schedule.log", level=logging.INFO, format="%(asctime)s - %(message)s")
+logging.basicConfig(filename="logs/create-game-schedule.log", level=logging.INFO, format="%(asctime)s - %(message)s")
 
 # Connect to the database and fetch game times
 def get_game_times_for_week(week):
@@ -28,21 +28,20 @@ def get_game_times_for_week(week):
         return []
 
 # Function to add a cron job dynamically
-def add_cron_job(script_path, run_time, week, game_id):
+def add_cron_job(script_name, run_time, week, game_id):
     cron_user = os.getenv("USER") or os.getlogin()
     cron = CronTab(user=cron_user)
-    job = cron.new(command=f'python {script_path}', comment=f'week_{week}_game_{game_id}')
+    job = cron.new(command=f'python {script_name}', comment=f'week_{week}_game_{game_id}')
     job.setall(run_time)
     cron.write()
+    logging.info(f"Added cron job for {script_name} at {run_time} for week {week}, game {game_id}")
 
 # Function to remove all cron jobs related to the previous week
 def remove_old_jobs(week):
-    if week < 7:
-        return  # No jobs exist for weeks before week 7
     cron_user = os.getenv("USER") or os.getlogin()
     cron = CronTab(user=cron_user)
     for job in cron:
-        if f'week_{week}' in job.comment:
+        if f'week_{week - 1}' in job.comment:
             cron.remove(job)
             logging.info(f"Removed cron job: {job}")
     cron.write()
