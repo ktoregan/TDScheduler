@@ -1,13 +1,14 @@
-import mysql.connector
 import os
 import logging
 import requests
 from dotenv import load_dotenv
+from database import get_db_connection  # Import the database connection function
+import time
 
 # Load environment variables
 load_dotenv()
 
-# Discord API helper function
+# Discord API helper function with retries
 def send_discord_message(DISCORD_CHANNEL_ID, message):
     url = f'https://discord.com/api/channels/{DISCORD_CHANNEL_ID}/messages'
     headers = {
@@ -17,37 +18,37 @@ def send_discord_message(DISCORD_CHANNEL_ID, message):
     data = {
         'content': message
     }
-    response = requests.post(url, headers=headers, json=data)
-    if response.status_code == 200:
-        logging.info("Message sent successfully!")
-    else:
-        logging.error(f"Failed to send message: {response.status_code}")
+
+    for attempt in range(3):  # Retry up to 3 times
+        response = requests.post(url, headers=headers, json=data)
+        if response.status_code == 200:
+            logging.info("Message sent successfully!")
+            return True
+        else:
+            logging.error(f"Attempt {attempt + 1} failed to send message: {response.status_code}")
+            time.sleep(2)  # Wait for 2 seconds before retrying
+
+    logging.error("Failed to send message after 3 attempts.")
+    return False
 
 # Function to build a table format similar to pick history
 def format_leaderboard_table(rows, header):
     table = header
     table += '------------------------------------\n'
-    
+
     for row in rows:
         week = str(row['week']).ljust(2)
         player_name = row['player_name'].ljust(26)
         td_status = '✅' if row['is_successful'] else '❌'
         points = str(row['points']).rjust(1)
         table += f'{week} {player_name} {td_status} {points}\n'
-    
+
     return table
 
 # Function to fetch the leaderboard data
 def fetch_leaderboard_data():
     try:
-        db = mysql.connector.connect(
-            host=os.getenv("MYSQL_HOST"),
-            user=os.getenv("MYSQL_USER"),
-            password=os.getenv("MYSQL_PASSWORD"),
-            database=os.getenv("MYSQL_DB"),
-            port=os.getenv("MYSQL_PORT"),
-            ssl_ca=os.getenv('SSL_CERT_PATH')
-        )
+        db = get_db_connection()  # Use the get_db_connection function from database.py
         cursor = db.cursor(dictionary=True)
 
         # Fetch the weekly leaderboard
@@ -56,7 +57,7 @@ def fetch_leaderboard_data():
             FROM picks p
             JOIN players pl ON p.player_id = pl.player_id
             WHERE p.is_successful = 1
-            GROUP BY p.user_id, p.week
+            GROUP BY p.user_id, p.week, pl.player_name, p.is_successful
             ORDER BY p.week;
         """)
         weekly_leaderboard = cursor.fetchall()
@@ -75,14 +76,14 @@ def fetch_leaderboard_data():
 
         return weekly_leaderboard, overall_leaderboard
 
-    except mysql.connector.Error as err:
+    except Exception as err:
         logging.error(f"Database connection failed: {err}")
         return None, None
 
 # Main function to generate and send the leaderboard
 def generate_and_send_leaderboard():
     weekly_leaderboard, overall_leaderboard = fetch_leaderboard_data()
-    
+
     if weekly_leaderboard is None or overall_leaderboard is None:
         logging.error("No leaderboard data to display.")
         return
@@ -103,7 +104,8 @@ def generate_and_send_leaderboard():
     full_message = f"```\n{formatted_weekly}\n{overall_table}\n```"
 
     # Send the message to the Discord channel
-    send_discord_message(os.getenv("DISCORD_DISCORD_CHANNEL_ID"), full_message)
+    if not send_discord_message(os.getenv("DISCORD_CHANNEL_ID"), full_message):
+        logging.error("Failed to send leaderboard message.")
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -111,7 +113,7 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s"
     )
-    
+
     logging.info("Generating and sending leaderboard...")
     generate_and_send_leaderboard()
-    logging.info("Leaderboard sent successfully.")
+    logging.info("Leaderboard process completed.")

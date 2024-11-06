@@ -12,8 +12,26 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+# Function to update API usage count
+def update_api_usage(api_calls, db, cursor):
+    current_month_year = datetime.now().strftime("%Y-%m")
+
+    # Check the current usage for the month
+    cursor.execute("SELECT request_count FROM api_usage WHERE month_year = %s", (current_month_year,))
+    result = cursor.fetchone()
+
+    if result:
+        new_count = result[0] + api_calls
+        cursor.execute("UPDATE api_usage SET request_count = %s, request_time = NOW() WHERE month_year = %s",
+                       (new_count, current_month_year))
+        logging.info(f"Updated API usage for month {current_month_year}: new count is {new_count}")
+    else:
+        cursor.execute("INSERT INTO api_usage (request_count, request_time, month_year) VALUES (%s, NOW(), %s)",
+                       (api_calls, current_month_year))
+        logging.info(f"Inserted new API usage record for month {current_month_year}: count is {api_calls}")
+
 # Function to fetch injured players from the API
-async def fetch_injury_status(player_ids):
+async def fetch_injury_status(player_ids, db, cursor):
     url = "https://tank01-nfl-live-in-game-real-time-statistics-nfl.p.rapidapi.com/getNFLPlayerList"
     headers = {
         "x-rapidapi-key": os.getenv("RAPIDAPI_KEY"),
@@ -28,6 +46,7 @@ async def fetch_injury_status(player_ids):
                 if response.status == 200:
                     logging.info("Successfully fetched player injury status from API")
                     response_data = await response.json()
+                    update_api_usage(1, db, cursor)  # Update API usage count by 1 for this API call
                     return response_data.get('body', [])
                 else:
                     error_text = await response.text()
@@ -42,17 +61,17 @@ async def update_injury_status(players, db, cursor):
     async with aiohttp.ClientSession() as session:
         for player in players:
             player_id = player.get("playerID")
-            injury_status = player["injury"].get("designation", "Healthy")
+            injury_status = player["injury"].get("designation", "Unknown")
 
-            if injury_status in ["Doubtful", "Out", "Injured Reserve"]:
-                logging.info(f"Player {player_id} is injured with status {injury_status}")
+            if injury_status in ["Out", "Injured Reserve"]:
+                logging.info(f"Player {player_id} is listed as {injury_status}, removing pick.")
                 try:
-                    # Update only those players in the picks table who have been marked as injured
+                    # Remove the player's pick if status is "Out" or "Injured Reserve"
                     cursor.execute("""
-                        UPDATE picks SET Is_injured = 1
-                        WHERE player_id = %s AND is_successful = 0 AND Is_injured = 0
+                        DELETE FROM picks
+                        WHERE player_id = %s AND is_successful = 0
                     """, (player_id,))
-                    logging.info(f"Updated injury status for player_id {player_id} in picks table")
+                    logging.info(f"Removed pick for player_id {player_id} due to status: {injury_status}")
 
                     # Fetch the user IDs who picked the injured player
                     cursor.execute("""
@@ -60,15 +79,15 @@ async def update_injury_status(players, db, cursor):
                     """, (player_id,))
                     tagged_users = [row['user_id'] for row in cursor.fetchall()]
 
-                    # Trigger the webhook to notify users about the injury
+                    # Trigger the webhook to notify users to pick a new player
                     if tagged_users:
-                        await send_injury_notification(session, player.get("fullName"), injury_status, tagged_users)
+                        await send_injury_notification(session, player.get("longName"), injury_status, tagged_users)
 
                 except Exception as e:
-                    logging.error(f"Failed to update injury status for player_id {player_id}: {e}")
+                    logging.error(f"Failed to remove pick for player_id {player_id}: {e}")
                     logging.error(traceback.format_exc())
 
-# Function to send injury notification via webhook
+# Function to send injury notification via webhook for players "Out" or "Injured Reserve"
 async def send_injury_notification(session, player_name, injury_status, tagged_users):
     url = "http://localhost:3000/webhook/player-injury"
     headers = {
@@ -106,7 +125,7 @@ async def main():
             return
 
         # Fetch the injury status for only the relevant players
-        players = await fetch_injury_status(player_ids)
+        players = await fetch_injury_status(player_ids, db, cursor)
         if players:
             await update_injury_status(players, db, cursor)
 

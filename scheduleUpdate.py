@@ -73,7 +73,6 @@ async def fetch_game_data():
                 if response.status == 200:
                     logging.info("Successfully fetched game schedule from API")
                     response_data = await response.json()
-                    update_api_usage(1)
                     return response_data.get('body', []), 1
                 else:
                     error_text = await response.text()
@@ -203,9 +202,10 @@ async def main():
         if games:
             logging.info(f"Fetched {len(games)} games from the API.")
             upsert_game_data(games, db, cursor)  # Call to upsert game data directly after fetching games.
-            for week in range(1, 19):  # Example for 18 weeks
+            for week in range(7, 19):  # Only weeks from 7 to 18 as per the given mapping.
                 update_pick_window_table(games, week, season, db, cursor)
 
+        # Update API usage here with the correct arguments
         update_api_usage(api_calls, db, cursor)
         logging.info("Game schedule update completed successfully.")
     except Exception as e:
